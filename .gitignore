@@ -1,0 +1,14 @@
+# macOS metadata
+._*
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Output
+output/
+*.mp4

@@ -1,0 +1,9 @@
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.11
+matplotlib>=3.7
+tqdm>=4.66
+Pillow>=10.0
+scikit-image>=0.21
+# gyroflow Python bindings — install separately:
+#   pip install gyroflow-toolbox
