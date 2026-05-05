@@ -30,6 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
+from typing import Optional
 
 from rolling_shutter import load_corrector, RSCorrectionResult
 from perspective_quantifier import quantify_video, PerspErrorReport
@@ -37,6 +38,12 @@ from perspective_corrector import (
     LensSensorParams,
     correct_frames,
     visualise_warp_field,
+)
+from blur_quantifier import (
+    quantify_blur_fft,
+    quantify_blur_spatial,
+    BlurReportFFT,
+    BlurReportSpatial,
 )
 
 
@@ -52,6 +59,27 @@ def save_heatmap(report: PerspErrorReport, path: str, title: str = ""):
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Saved heatmap → {path}")
+
+
+def save_blur_heatmap(report: BlurReportSpatial, path: str, title: str = ""):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    im = ax.imshow(report.blur_map, cmap="hot", aspect="auto",
+                   vmin=0, vmax=max(report.max_sigma, 0.1))
+    plt.colorbar(im, ax=ax, label="blur sigma (px)")
+    ax.set_title(title or report.label)
+
+    # Mark query point if available
+    if report.query_coords is not None:
+        qx, qy = report.query_coords
+        ax.plot(qx, qy, 'c*', markersize=15, markeredgecolor='white', markeredgewidth=1.5)
+        ax.text(qx + 20, qy, f'{report.query_sigma:.1f} px',
+                color='cyan', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved blur heatmap → {path}")
 
 
 def save_comparison_heatmap(
@@ -95,6 +123,8 @@ def save_report(
     after: PerspErrorReport,
     params: LensSensorParams,
     path: str,
+    blur_before: Optional[BlurReportSpatial] = None,
+    blur_after: Optional[BlurReportSpatial] = None,
 ) -> dict:
     eps = 1e-9
     data = {
@@ -127,6 +157,36 @@ def save_report(
             "max":  round((1 - after.max_warp_px   / (before.max_warp_px  + eps)) * 100, 1),
         },
     }
+
+    # Add blur metrics if available
+    if blur_before is not None and blur_after is not None:
+        data["blur_before_correction"] = {
+            "mean_sigma_px":     round(blur_before.mean_sigma, 4),
+            "p95_sigma_px":      round(blur_before.p95_sigma, 4),
+            "max_sigma_px":      round(blur_before.max_sigma, 4),
+            "edge_centre_ratio": round(blur_before.edge_centre_ratio, 3),
+        }
+        data["blur_after_correction"] = {
+            "mean_sigma_px":     round(blur_after.mean_sigma, 4),
+            "p95_sigma_px":      round(blur_after.p95_sigma, 4),
+            "max_sigma_px":      round(blur_after.max_sigma, 4),
+            "edge_centre_ratio": round(blur_after.edge_centre_ratio, 3),
+        }
+        data["blur_reduction_pct"] = {
+            "mean": round((1 - blur_after.mean_sigma / (blur_before.mean_sigma + eps)) * 100, 1),
+            "p95":  round((1 - blur_after.p95_sigma  / (blur_before.p95_sigma  + eps)) * 100, 1),
+            "max":  round((1 - blur_after.max_sigma   / (blur_before.max_sigma  + eps)) * 100, 1),
+        }
+
+        # Add query point data if available
+        if blur_before.query_sigma is not None and blur_after.query_sigma is not None:
+            data["blur_query_point"] = {
+                "coords": blur_before.query_coords,
+                "before_px": round(blur_before.query_sigma, 2),
+                "after_px": round(blur_after.query_sigma, 2),
+                "reduction_pct": round((1 - blur_after.query_sigma / (blur_before.query_sigma + eps)) * 100, 1),
+            }
+
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
     print(f"  Saved report → {path}")
@@ -196,16 +256,69 @@ def run_pipeline(args):
     save_comparison_heatmap(report_before, report_after,
                             str(out / "heatmap_comparison.png"))
 
+    # ── Stage 4: Blur quantification ──────────────────────────────────────────
+    blur_before = None
+    blur_after = None
+
+    if args.blur_query_x is not None and args.blur_query_y is not None:
+        query_coords = (args.blur_query_x, args.blur_query_y)
+        print(f"\n[Stage 4] Blur quantification at query point {query_coords} …")
+
+        # Quantify blur BEFORE correction (use middle frame)
+        mid_idx = len(rs_frames) // 2
+        blur_before = quantify_blur_spatial(
+            rs_frames[mid_idx],
+            model_path=args.blur_model,
+            window_size=args.blur_window,
+            stride=args.blur_stride,
+            query_coords=query_coords,
+        )
+        blur_before.label = "blur_before_correction"
+        blur_before.print_summary()
+        save_blur_heatmap(blur_before, str(out / "blur_heatmap_before.png"),
+                         "Blur BEFORE correction (px)")
+
+        # Quantify blur AFTER correction
+        blur_after = quantify_blur_spatial(
+            corrected_frames[mid_idx],
+            model_path=args.blur_model,
+            window_size=args.blur_window,
+            stride=args.blur_stride,
+            query_coords=query_coords,
+        )
+        blur_after.label = "blur_after_correction"
+        blur_after.print_summary()
+        save_blur_heatmap(blur_after, str(out / "blur_heatmap_after.png"),
+                         "Blur AFTER correction (px)")
+
+        # Print blur reduction at query point
+        if blur_before.query_sigma and blur_after.query_sigma:
+            reduction = (1 - blur_after.query_sigma / blur_before.query_sigma) * 100
+            print(f"\n{'='*52}")
+            print(f"  Blur at {query_coords}:")
+            print(f"    Before : {blur_before.query_sigma:.1f} px")
+            print(f"    After  : {blur_after.query_sigma:.1f} px")
+            print(f"    Reduction : {reduction:.1f}%")
+            print(f"{'='*52}")
+
     # ── Final report ──────────────────────────────────────────────────────────
     print("\n[Report] Writing JSON summary …")
     data = save_report(report_before, report_after, params,
-                       str(out / "report.json"))
+                       str(out / "report.json"),
+                       blur_before, blur_after)
 
     r = data["reduction_pct"]
     print(f"\n{'='*52}")
     print(f"  Mean warp reduction : {r['mean']:>6.1f}%")
     print(f"  P95  warp reduction : {r['p95']:>6.1f}%")
     print(f"  Max  warp reduction : {r['max']:>6.1f}%")
+
+    if "blur_reduction_pct" in data:
+        br = data["blur_reduction_pct"]
+        print(f"\n  Mean blur reduction : {br['mean']:>6.1f}%")
+        print(f"  P95  blur reduction : {br['p95']:>6.1f}%")
+        print(f"  Max  blur reduction : {br['max']:>6.1f}%")
+
     print(f"{'='*52}")
     print(f"\nAll outputs saved to: {out.resolve()}")
 
@@ -226,6 +339,14 @@ def main():
     p.add_argument("--p2",         type=float, default=0.0,     help="Tangential distortion p2")
     p.add_argument("--max-frames", type=int,   default=None,    help="Limit frames processed")
     p.add_argument("--out-dir",    default="./output",          help="Output directory")
+
+    # Blur quantification options
+    p.add_argument("--blur-query-x", type=int, default=None,    help="Query point X coordinate for blur measurement")
+    p.add_argument("--blur-query-y", type=int, default=None,    help="Query point Y coordinate for blur measurement")
+    p.add_argument("--blur-model",   default=None,              help="Path to blur-kernel-estimation model (optional)")
+    p.add_argument("--blur-window",  type=int, default=32,      help="Sliding window size for blur estimation")
+    p.add_argument("--blur-stride",  type=int, default=16,      help="Stride for sliding window")
+
     args = p.parse_args()
     run_pipeline(args)
 
