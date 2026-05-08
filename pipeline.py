@@ -45,6 +45,7 @@ from blur_quantifier import (
     BlurReportFFT,
     BlurReportSpatial,
 )
+from quality_analyzer import QualityAnalyzer, QualityReport
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -198,6 +199,7 @@ def save_report(
 def run_pipeline(args):
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    analyzer = QualityAnalyzer()
 
     # ── Stage 1: Rolling-shutter correction ───────────────────────────────────
     print("\n[Stage 1] Rolling-shutter correction …")
@@ -301,11 +303,37 @@ def run_pipeline(args):
             print(f"    Reduction : {reduction:.1f}%")
             print(f"{'='*52}")
 
+    # ── Stage 5: Quality assessment ───────────────────────────────────────────
+    print("\n[Stage 5] Computing IQA quality scores …")
+    quality_report = analyzer.analyze(
+        rs_result=rs_result,
+        persp_before=report_before,
+        persp_after=report_after,
+        blur_before=blur_before,
+        blur_after=blur_after,
+    )
+    print(f"  IQA score before : {quality_report.score_before:.1f} / 100")
+    print(f"  IQA score after  : {quality_report.score_after:.1f} / 100")
+    print(f"  Correction gain  : {quality_report.gain_pct:+.1f}%")
+    print(f"  Defect weights   : RS={quality_report.weight_rs:.2f}  "
+          f"Persp={quality_report.weight_persp:.2f}  "
+          f"Blur={quality_report.weight_blur:.2f}")
+    analyzer.generate_summary_report(
+        quality_report, str(out / "summary_report.png")
+    )
+
     # ── Final report ──────────────────────────────────────────────────────────
     print("\n[Report] Writing JSON summary …")
     data = save_report(report_before, report_after, params,
                        str(out / "report.json"),
                        blur_before, blur_after)
+
+    # Merge quality assessment into report.json
+    quality_dict = analyzer.to_dict(quality_report)
+    data.update(quality_dict)
+    with open(str(out / "report.json"), "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  Updated report (with IQA) → {out / 'report.json'}")
 
     r = data["reduction_pct"]
     print(f"\n{'='*52}")
@@ -318,6 +346,11 @@ def run_pipeline(args):
         print(f"\n  Mean blur reduction : {br['mean']:>6.1f}%")
         print(f"  P95  blur reduction : {br['p95']:>6.1f}%")
         print(f"  Max  blur reduction : {br['max']:>6.1f}%")
+
+    qa = data["quality_assessment"]
+    print(f"\n  IQA score before : {qa['iqa_score_before']:>6.2f} / 100")
+    print(f"  IQA score after  : {qa['iqa_score_after']:>6.2f} / 100")
+    print(f"  Correction gain  : {qa['correction_gain_pct']:>+6.2f}%")
 
     print(f"{'='*52}")
     print(f"\nAll outputs saved to: {out.resolve()}")
